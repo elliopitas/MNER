@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
 pub struct Config {
+    pub name: String,
     pub hosts: Vec<String>,
     pub workdir: String,
     pub executable: String,
@@ -18,6 +19,11 @@ pub struct Permutation {
 }
 
 impl Config {
+    pub fn new(name: &str) -> Config {
+        let s = fs::read_to_string(name).expect("failed to read config file");
+
+        toml::from_str(&s).expect("failed to parse TOML into Config")
+    }
     pub fn get_arguments_permutations(&self) -> Vec<Permutation> {
         let mut permutations: Vec<Permutation> = Vec::new();
 
@@ -68,10 +74,4 @@ fn generate_recursive(
         generate_recursive(args, index + 1, current, permutations);
         current.pop();
     }
-}
-
-pub fn parse_config(name: &str) -> Config {
-    let s = fs::read_to_string(name).expect("failed to read config file");
-
-    toml::from_str(&s).expect("failed to parse TOML into Config")
 }

@@ -1,4 +1,5 @@
-hosts = ["localhost"]
+name = "test"
+hosts = ["constantinides"]
 workdir = "./workdir"
 executable = "test.sh"
 repeat = 2
