@@ -1,7 +1,7 @@
 mod run;
 
+use spdlog::prelude::*;
 use std::fmt::format;
-use log::{debug, info, error};
 use clap::{Parser, Subcommand};
 use anyhow::{Context, Result};
 use futures::future::err;
@@ -34,7 +34,7 @@ struct SshAgent{
 
 impl Drop for SshAgent {
     fn drop(&mut self) {
-        println!("Shutting down ssh-agent (PID: {})...", self.pid);
+        info!("Shutting down ssh-agent (PID: {})...", self.pid);
         let _ = std::process::Command::new("kill")
             .arg(self.pid.to_string())
             .status();
@@ -66,13 +66,13 @@ async unsafe fn setup_ssh_agent(keys: &[String]) -> Result<SshAgent> {
     }
 
     let pid = agent_pid.context("Could not parse SSH_AGENT_PID from ssh-agent output.")?;
-    println!("ssh-agent started with PID: {}", pid);
+    info!("ssh-agent started with PID: {}", pid);
 
     let mut cmd = Command::new("ssh-add");
     if keys.is_empty() {
-        println!("No SSH keys specified, attempting to add default identities...");
+        warn!("No SSH keys specified, attempting to add default identities...");
     } else {
-        println!("Adding specified SSH keys to agent: {:?}", keys);
+        info!("Adding specified SSH keys to agent: {:?}", keys);
         cmd.args(keys);
     }
     let add_status = cmd.status().await.context("Failed to execute ssh-add.")?;
@@ -86,6 +86,7 @@ async unsafe fn setup_ssh_agent(keys: &[String]) -> Result<SshAgent> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    spdlog::default_logger().set_level_filter(spdlog::LevelFilter::All);
     match args.command {
         Commands::Run { config, output, ssh_keys } => unsafe {
             let _agent = setup_ssh_agent(&ssh_keys).await?;
