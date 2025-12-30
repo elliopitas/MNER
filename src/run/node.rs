@@ -1,11 +1,11 @@
 use async_ssh2_tokio::client::{Client, AuthMethod, ServerCheckMethod};
 use std::env;
-use tokio::process::Command;
 use ssh_config::SSHConfig;
 use std::fs;
 use home;
 use self_cell::self_cell;
 use anyhow::{Context, Result};
+use super::commands;
 
 self_cell!(
 	struct SshConfigCell{
@@ -52,7 +52,7 @@ impl Node {
 		if let Some(ssh_config_cell) = &common.ssh_config {
 			ssh_config_cell.with_dependent(|_owner, ssh_config| {
 				let params = ssh_config.query(hostname);
-				if (!params.is_empty()) {
+				if !params.is_empty() {
 					if let Some(host_name_cfg) = params.get("HostName"){
 						host_name = host_name_cfg.to_string();
 					}
@@ -85,23 +85,22 @@ impl Node {
 		Ok(node)
 	}
 
-	pub async fn rsync(&self, from: &str, to: &str) -> Result<()> {
-		let mkdir_output = self.client.execute(format!("mkdir -p {}", to).as_str()).await.context("Failed to create remote directory")?;
-		if mkdir_output.exit_status != 0 {
-			return Err(anyhow::anyhow!("Failed to create remote directory: {}", mkdir_output.stderr));
-		}
-		let from_path = if from.ends_with('/') && !fs::metadata(from).map(|m| m.is_dir()).unwrap_or(false){
-			from.to_string()
-		}else {
+	fn rsync_from_folder (from: &str) -> String {
+		if !from.ends_with('/'){
 			format!("{}/", from)
-		};
-		let to = format!("{}:{}", self.hostname, to);
-		let output = Command::new("rsync").arg("-arz").arg(from_path).arg(to).output().await?;
-		if !output.status.success() {
-			let stderr = String::from_utf8_lossy(&output.stderr);
-			return Err(anyhow::anyhow!("rsync failed: {}", stderr));
+		}else { 
+			from.to_string()
 		}
-		Ok(())
+	}
+
+	pub async fn rsync_from(&self, from: &str, to: &str, delete_src: bool) -> Result<()> {
+		let from = Self::rsync_from_folder(from);
+		commands::rsync(&format!("{}:{}", self.hostname, from), to, delete_src).await
+	}
+
+	pub async fn rsync_to(&self, from: &str, to: &str, delete_src: bool) -> Result<()> {
+		let from = Self::rsync_from_folder(from);
+		commands::rsync(from.as_str(), &format!("{}:{}", self.hostname, to), delete_src).await
 	}
 
 	pub async fn rm(&self, dir: &str) -> Result<()> {

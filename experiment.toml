@@ -1,8 +1,9 @@
 name = "test"
-hosts = ["constantinides"]
+hosts = ["constantinides", "localhost"]
 workdir = "./workdir"
 executable = "test.sh"
 repeat = 2
+threads_per_task = 1
 
 [arguments]
 hash_size = ["64", "32"]

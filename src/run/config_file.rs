@@ -9,7 +9,14 @@ pub struct Config {
     pub workdir: String,
     pub executable: String,
     pub repeat: usize,
+    pub threads_per_task: usize,
     pub arguments: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Permutation {
+    pub id: String,
+    pub parameters: String
 }
 
 impl Config {

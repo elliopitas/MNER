@@ -1,13 +1,18 @@
 mod run;
 
 use spdlog::prelude::*;
-use std::fmt::format;
 use clap::{Parser, Subcommand};
 use anyhow::{Context, Result};
-use futures::future::err;
-use futures::FutureExt;
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use std::sync::Arc;
+use futures::future::{join_all};
+use tokio::process::{Command};
+use std::fs;
+use std::fs::File;
+use std::io::Write;
+use std::path::Path;
+use crossbeam_queue::ArrayQueue;
+use log::info;
+use crate::run::config_file::Permutation;
 
 #[derive(Parser, Debug)]
 #[command(author = "Georgios Constantinides", version = "0.0.1", about = "Run experiments with a permutation of different parameters on multiple ssh nodes", long_about = None)]
@@ -57,7 +62,9 @@ async unsafe fn setup_ssh_agent(keys: &[String]) -> Result<SshAgent> {
     for line in stdout.lines() {
         if let Some(var_line) = line.split(';').next() {
             if let Some((key, value)) = var_line.split_once('=') {
-                std::env::set_var(key, value);
+                unsafe {
+                    std::env::set_var(key, value);
+                }
                 if key == "SSH_AGENT_PID" {
                     agent_pid = value.parse::<u32>().ok();
                 }
@@ -94,26 +101,128 @@ async fn main() -> Result<()> {
             debug!("Running with config: {} and output:{}", config, output);
             let config_struct = run::config_file::Config::new(&config);
             debug!("Loaded config: {:?}", config_struct);
-            let permutations = config_struct.get_arguments_permutations();
+            let mut permutations = config_struct.get_arguments_permutations();
             debug!("Permutations: {:?}", permutations);
-            let nodes = run::nodes::Nodes::new(&config_struct.hosts).await.expect("Failed to connect to nodes");
-            let path = format!("/tmp/MNER/{}", &config_struct.name);
-            let path_str = path.as_str();
-            for node in nodes.nodes.iter() {
-                debug!("Syncing {} to {}", &config_struct.workdir,  node.hostname);
-                match node.rsync(&config_struct.workdir, format!("{path_str}/workdir").as_str()).await {
-                    Ok(_) => {
-                        debug!("Synced {} to {}/workdir", &config_struct.workdir,  node.hostname);
-
-                        match node.rm(path_str).await {
-                            Ok(_) => debug!("Removed {} from {}", path_str, node.hostname),
-                            Err(err) => debug!("Failed to remove {} from {}\n{}", path_str, node.hostname, err)
+            let results_path_string = format!("./results/{}", &config_struct.name);
+            let results_path = Path::new(results_path_string.as_str());
+            match fs::create_dir_all(results_path){
+                Ok(_) => {
+                    for entry in fs::read_dir(results_path)? {
+                        let valid_entry = entry.expect("Error reading result folder name");
+                        let folder_name = valid_entry.file_name();
+                        let folder_name_str = folder_name.to_str().expect("Failed to convert results folder name to string");
+                        if permutations.contains_key(folder_name_str) && valid_entry.path().join("complete").exists() {
+                            permutations.remove(folder_name_str).expect("Failed to remove found permutation");
                         }
-                    },
-                    Err(err) => error!("Failed to rsync data to host {}\n{}", node.hostname, err),
-                }
-            }
+                    }
+                let queue = Arc::new(ArrayQueue::<Permutation>::new(permutations.len()));
+                    for permutation in permutations {
+                        queue.push(Permutation {
+                            id: permutation.0,
+                            parameters: permutation.1
+                        }).expect("Task queue full. This should not have happened");
+                    }
 
+                    let nodes = run::nodes::Nodes::new(&config_struct.hosts).await.expect("Failed to connect to nodes");
+
+                    let temp_path_string = format!("/tmp/MNER/{}", &config_struct.name);
+                    let temp_path = Path::new(temp_path_string.as_str());
+                    let temp_workdir =  temp_path.join("workdir");
+                    let temp_workdir_str = temp_workdir.to_str().expect("failed to create path string for workdir");
+                    let temp_results_path = temp_path.join("results");
+                    let temp_results_path = &temp_results_path;
+                    let temp_workdir_executable_path = temp_workdir.join(&config_struct.executable);
+                    let temp_workdir_executable_str = temp_workdir_executable_path.to_str().expect("failed to create temp workdir executable path string");
+
+                    let config_struct = &config_struct;
+                    let queue = queue.clone();
+                    let node_futures = nodes.nodes.iter().map(|node| {
+                        let queue = queue.clone();
+                        async move {
+                        debug!("Syncing {} to {}", &config_struct.workdir,  node.hostname);
+                        match node.rsync_to(&config_struct.workdir, temp_workdir_str, false).await {
+                            Ok(_) => {
+                                debug!("Synced {} to {}/workdir", &config_struct.workdir,  node.hostname);
+                                let concurrency = if config_struct.threads_per_task == 0 {1} else  {node.threads/config_struct.threads_per_task};
+                                let mut node_worker_futures = Vec::with_capacity(concurrency);
+                                for _ in 0..concurrency{
+
+                                    let queue = queue.clone();
+                                    node_worker_futures.push(async move {
+                                        loop{
+                                            match queue.pop() {
+                                                None => break,
+                                                Some(permutation) => {
+                                                    let tmp_permutation_result_path = temp_results_path.join(&permutation.id);
+                                                    let tmp_permutation_result_path_str = tmp_permutation_result_path.to_str().expect("failed to create path string for job result");
+                                                    match node.client.execute(format!("mkdir -p {tmp_permutation_result_path_str} && cd {tmp_permutation_result_path_str} && {temp_workdir_executable_str} {}", permutation.parameters).as_str()).await {
+                                                        Ok(output) =>{
+                                                            let permutation_result_path = results_path.join(&permutation.id);
+                                                            let permutation_result_path_str = permutation_result_path.to_str().expect("failed to convert permutation_result_path to string");
+                                                            let _ = fs::remove_dir_all(&permutation_result_path);
+                                                            match fs::create_dir_all(&permutation_result_path){
+                                                                Ok(_)=>{
+                                                                    if output.exit_status == 0{
+                                                                        match node.rsync_from(tmp_permutation_result_path_str, permutation_result_path_str, true).await{
+                                                                            Ok(_) => {
+                                                                                if let Err(err) = File::create(permutation_result_path.join("succeeded")) {
+                                                                                    error!("failed to create \"succeeded\" file for job {}\n{}", permutation.id, err);
+                                                                                }
+                                                                            },
+                                                                            Err(err) => error!("failed to rsync completed data of task from {} to {}\n{}",tmp_permutation_result_path_str, permutation_result_path_str, err)
+                                                                        }
+                                                                    }else {
+                                                                        match File::create(permutation_result_path.join("failed")){
+                                                                            Ok(_) => {}, //create empty file
+                                                                            Err(err) => error!("failed to create \"failed\" file for job {}\n{}", permutation.id, err)
+                                                                        }
+                                                                    }
+
+                                                                    match File::create(permutation_result_path.join("stdout")) {
+                                                                        Ok(mut file) => {
+                                                                            if let Err(err) = file.write(output.stdout.as_bytes()){
+                                                                                error!("failed to write data to stdout file for {}\n{}", permutation.id, err);
+                                                                            }
+                                                                        },
+                                                                        Err(err) => error!("failed to create stdout file for {}\n{}", permutation.id, err)
+                                                                    }
+                                                                    match File::create(permutation_result_path.join("stderr")) {
+                                                                        Ok(mut file) => {
+                                                                            if let Err(err) = file.write(output.stderr.as_bytes()){
+                                                                                error!("failed to write data to stderr file for {}\n{}", permutation.id, err);
+                                                                            }
+                                                                        },
+                                                                        Err(err) => error!("failed to create stderr file for {}\n{}", permutation.id, err)
+                                                                    }
+                                                                },
+                                                                Err(err) => error!("failed to create result for job: {}\n{}", permutation.id, err)
+                                                            }
+                                                        },
+                                                        Err(err) => error!("failed to execute task {} on {}\n{}", permutation.id, node.hostname, err)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                join_all(node_worker_futures).await;
+                            },
+                            Err(err) => error!("Failed to rsync data to host {}. It will be skipped\n{}", node.hostname, err),
+                        }
+                    }
+                    });
+                    join_all(node_futures).await;
+
+                    let cleanup_futures = nodes.nodes.iter().map(|node| async {
+                        match node.rm(temp_path_string.as_str()).await {
+                            Ok(_) => debug!("Removed {} from {}", temp_path_string, node.hostname),
+                            Err(err) => debug!("Failed to remove {} from {}\n{}", temp_path_string, node.hostname, err)
+                        }
+                    });
+                    join_all(cleanup_futures).await;
+                },
+                Err(err) => error!("Failed to create results directory\n{}", err),
+            }
 
         }
         Commands::Collect => {
