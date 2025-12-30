@@ -6,12 +6,12 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 use futures::future::{join_all};
 use tokio::process::{Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use crossbeam_queue::ArrayQueue;
-use log::info;
 use crate::run::config_file::Permutation;
 
 #[derive(Parser, Debug)]
@@ -115,7 +115,9 @@ async fn main() -> Result<()> {
                             permutations.remove(folder_name_str).expect("Failed to remove found permutation");
                         }
                     }
+                let total_jobs = permutations.len();
                 let queue = Arc::new(ArrayQueue::<Permutation>::new(permutations.len()));
+                let failed_count = Arc::new(AtomicUsize::new(0));
                     for permutation in permutations {
                         queue.push(Permutation {
                             id: permutation.0,
@@ -136,8 +138,10 @@ async fn main() -> Result<()> {
 
                     let config_struct = &config_struct;
                     let queue = queue.clone();
+                    let failed_count = failed_count.clone();
                     let node_futures = nodes.nodes.iter().map(|node| {
                         let queue = queue.clone();
+                        let failed_count = failed_count.clone();
                         async move {
                         debug!("Syncing {} to {}", &config_struct.workdir,  node.hostname);
                         match node.rsync_to(&config_struct.workdir, temp_workdir_str, false).await {
@@ -148,6 +152,7 @@ async fn main() -> Result<()> {
                                 for _ in 0..concurrency{
 
                                     let queue = queue.clone();
+                                    let failed_count = failed_count.clone();
                                     node_worker_futures.push(async move {
                                         loop{
                                             match queue.pop() {
@@ -169,13 +174,17 @@ async fn main() -> Result<()> {
                                                                                     error!("failed to create \"succeeded\" file for job {}\n{}", permutation.id, err);
                                                                                 }
                                                                             },
-                                                                            Err(err) => error!("failed to rsync completed data of task from {} to {}\n{}",tmp_permutation_result_path_str, permutation_result_path_str, err)
+                                                                            Err(err) => {
+                                                                                error!("failed to rsync completed data of task from {} to {}\n{}",tmp_permutation_result_path_str, permutation_result_path_str, err);
+                                                                                failed_count.fetch_add(1, Ordering::Relaxed);
+                                                                            }
                                                                         }
                                                                     }else {
                                                                         match File::create(permutation_result_path.join("failed")){
                                                                             Ok(_) => {}, //create empty file
                                                                             Err(err) => error!("failed to create \"failed\" file for job {}\n{}", permutation.id, err)
                                                                         }
+                                                                        failed_count.fetch_add(1, Ordering::Relaxed);
                                                                     }
 
                                                                     match File::create(permutation_result_path.join("stdout")) {
@@ -195,10 +204,16 @@ async fn main() -> Result<()> {
                                                                         Err(err) => error!("failed to create stderr file for {}\n{}", permutation.id, err)
                                                                     }
                                                                 },
-                                                                Err(err) => error!("failed to create result for job: {}\n{}", permutation.id, err)
+                                                                Err(err) => {
+                                                                    error!("failed to create result for job: {}\n{}", permutation.id, err);
+                                                                    failed_count.fetch_add(1, Ordering::Relaxed);
+                                                                }
                                                             }
                                                         },
-                                                        Err(err) => error!("failed to execute task {} on {}\n{}", permutation.id, node.hostname, err)
+                                                        Err(err) => {
+                                                            error!("failed to execute task {} on {}\n{}", permutation.id, node.hostname, err);
+                                                            failed_count.fetch_add(1, Ordering::Relaxed);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -220,6 +235,9 @@ async fn main() -> Result<()> {
                         }
                     });
                     join_all(cleanup_futures).await;
+                    let failed = failed_count.load(Ordering::Relaxed);
+                    let succeeded = total_jobs - failed - queue.len();
+                    info!("{}/{} failed: {}", succeeded, total_jobs, failed);
                 },
                 Err(err) => error!("Failed to create results directory\n{}", err),
             }
