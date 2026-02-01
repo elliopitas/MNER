@@ -113,12 +113,16 @@ async fn main() -> Result<()> {
 						let valid_entry = entry.expect("Error reading result folder name");
 						let folder_name = valid_entry.file_name();
 						let folder_name_str = folder_name.to_str().expect("Failed to convert results folder name to string");
-						if permutations.contains_key(folder_name_str) && valid_entry.path().join("complete").exists() {
+						if permutations.contains_key(folder_name_str) && valid_entry.path().join("succeeded").exists() {
 							permutations.remove(folder_name_str).expect("Failed to remove found permutation");
 						}
 					}
 					let total_jobs = permutations.len();
-					let queue = Arc::new(ArrayQueue::<Permutation>::new(permutations.len()));
+					if total_jobs == 0 {
+						info!("All just are already complete! no need to run anything");
+						return Ok(());
+					}
+					let queue = Arc::new(ArrayQueue::<Permutation>::new(total_jobs));
 					let failed_count = Arc::new(AtomicUsize::new(0));
 					for permutation in permutations {
 						queue.push(Permutation {
